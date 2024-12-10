@@ -1,0 +1,10 @@
+[
+  {
+    "id": "CM1B2",
+    "name": "Álgebra Lineal I",
+    "segments": [
+      { "day": 1, "bot": 12, "top": 14 },
+      { "day": 2, "bot": 15, "top": 18 }
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+(library
+ (public_name squeeze)
+ (name squeeze)
+ (libraries uucp yojson)
+ (preprocess
+  (pps ppx_deriving.enum ppx_yojson_conv)))
