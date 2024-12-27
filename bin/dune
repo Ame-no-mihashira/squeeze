@@ -1,0 +1,4 @@
+(executable
+ (public_name squeeze)
+ (name main)
+ (libraries squeeze))

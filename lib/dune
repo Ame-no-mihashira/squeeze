@@ -1,0 +1,5 @@
+(library
+ (name squeeze)
+ (libraries uucp yojson)
+ (preprocess
+  (pps ppx_deriving.eq ppx_deriving.ord ppx_deriving.enum ppx_yojson_conv)))
