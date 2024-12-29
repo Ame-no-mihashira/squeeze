@@ -1,14 +1,14 @@
-open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+let rec foldr_seq f xx b =
+  Seq.uncons xx
+  |> Option.fold ~none:b ~some:(fun (x, xx) -> foldr_seq f xx b |> f x)
 
-let sequence_seq xx =
-  let rec foldr_seq f xx b =
-    Seq.uncons xx
-    |> Option.fold ~none:b ~some:(fun (x, xx) -> foldr_seq f xx b |> f x)
-  in
-  let f x acc b = Result.bind x (fun x -> Result.map (Seq.cons x) (acc b)) in
-  foldr_seq f xx Result.ok Seq.empty
+let traverse_seq f xx =
+  foldr_seq
+    (fun f x -> Result.bind f (fun f -> Result.map f x))
+    (Seq.map (Fun.compose (Result.map Seq.cons) f) xx)
+    (Ok Seq.empty)
 
-let _ : ('a, 'e) result Seq.t -> ('a Seq.t, 'e) result = sequence_seq
+let sequence_seq xx = traverse_seq Fun.id xx
 
 module Name : sig
   type t
@@ -149,12 +149,11 @@ end = struct
 
   let inter a b =
     let a, b = if b.lo < a.hi then (a, b) else (b, a) in
-    let lo, hi = (b.lo, a.hi) in
     let lo, hi =
       let bounds =
         let ( let* ) = Result.bind in
-        let* lo = Time.make lo in
-        let* hi = Time.make hi in
+        let* lo = Time.make b.lo in
+        let* hi = Time.make a.hi in
         Ok (lo, hi)
       in
       Result.get_ok bounds
@@ -184,17 +183,13 @@ end = struct
   let empty = []
 
   let add x xx =
-    let split_by p =
-      let rec go f = function
-        | [] ->
-            (f [], [])
-        | x :: xx ->
-            if p x then
-              let g = List.cons x in
-              go (Fun.compose f g) xx
-            else (f [], xx)
+    let split_by p xx =
+      let map_fst f (a, b) = (f a, b) in
+      let map_snd f (a, b) = (a, f b) in
+      let f x g =
+        List.cons x |> (if p x then map_fst else map_snd) |> Fun.compose g
       in
-      go Fun.id
+      List.fold_right f xx Fun.id ([], [])
     in
     let aa, bb = split_by Span.(fun a -> a.lo < x.lo) xx in
     if
@@ -215,6 +210,8 @@ end = struct
 end
 
 module Schema = struct
+  open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+
   type span = int * int [@@deriving yojson]
 
   type entry = {id: string; name: string; table: span array array}
@@ -239,25 +236,19 @@ module Schema = struct
         let* bounds_matrix =
           Seq.init (Seq.length Day.values) (fun i ->
               try Array.to_seq table.(i) with Invalid_argument _ -> Seq.empty )
-          |> Seq.map
-               ( Seq.map (fun (lo, hi) ->
-                     let* lo = Time.make lo in
-                     let* hi = Time.make hi in
-                     Ok (lo, hi) )
-               |> Fun.compose sequence_seq )
-          |> sequence_seq
+          |> traverse_seq
+               (traverse_seq (fun (lo, hi) ->
+                    let* lo = Time.make lo in
+                    let* hi = Time.make hi in
+                    Ok (lo, hi) ) )
           |> Result.map_error (fun e -> BadTime e)
         in
         let* span_matrix =
           bounds_matrix
-          |> Seq.map
-               ( Seq.map (fun (lo, hi) -> Span.make lo hi)
-               |> Fun.compose sequence_seq )
-          |> sequence_seq
+          |> traverse_seq (traverse_seq (fun (lo, hi) -> Span.make lo hi))
           |> Result.map_error (fun e -> BadSpan e)
         in
-        span_matrix |> Seq.map Times.of_seq |> sequence_seq
-        |> Result.map Array.of_seq
+        span_matrix |> traverse_seq Times.of_seq |> Result.map Array.of_seq
         |> Result.map_error (fun e -> TimesCollision e)
       in
       Ok (id, (name, time_table))
@@ -269,8 +260,8 @@ module Schema = struct
       | o_name, o_time_table ->
           if Name.equal o_name name then
             let* tss =
-              Array.(map2 Times.fuse time_table o_time_table |> to_seq)
-              |> sequence_seq |> Result.map Array.of_seq
+              Array.map2 Times.fuse time_table o_time_table
+              |> Array.to_seq |> sequence_seq |> Result.map Array.of_seq
               |> Result.map_error (fun e -> TimesCollision e)
             in
             IdMap.add id (name, tss) acc |> Result.ok
