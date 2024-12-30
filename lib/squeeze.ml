@@ -210,14 +210,14 @@ end = struct
 end
 
 module Schema = struct
-  open Ppx_yojson_conv_lib.Yojson_conv.Primitives
+  open Sexplib.Std
 
-  type span = int * int [@@deriving yojson]
+  type span = int * int [@@deriving sexp]
 
   type entry = {id: string; name: string; table: span array array}
-  [@@deriving yojson]
+  [@@deriving sexp]
 
-  type t = entry array [@@deriving yojson]
+  type t = entry array [@@deriving sexp]
 
   type e =
     | BadId of Id.e

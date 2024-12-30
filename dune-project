@@ -11,4 +11,4 @@
 (package
  (name squeeze)
  (synopsis "Class schedule visualization software")
- (depends ocaml uucp yojson ppx_deriving ppx_yojson_conv))
+ (depends ocaml ppx_deriving uucp sexplib ppx_sexp_conv))
