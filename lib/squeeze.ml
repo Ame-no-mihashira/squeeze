@@ -2,9 +2,10 @@ let rec foldr_seq f xx b =
   Seq.uncons xx
   |> Option.fold ~none:b ~some:(fun (x, xx) -> foldr_seq f xx b |> f x)
 
+let apply_seq f x = Result.bind f (fun f -> Result.map f x)
+
 let traverse_seq f xx =
-  foldr_seq
-    (fun f x -> Result.bind f (fun f -> Result.map f x))
+  foldr_seq apply_seq
     (Seq.map (Fun.compose (Result.map Seq.cons) f) xx)
     (Ok Seq.empty)
 
@@ -98,6 +99,8 @@ end = struct
   let to_string n = [|"Mon"; "Tue"; "Wed"; "Thu"; "Fri"; "Sat"|].(n - min)
 end
 
+module DayMap = Map.Make (Day)
+
 module Time : sig
   type t
 
@@ -133,7 +136,7 @@ module Span : sig
 
   val disjoint : t -> t -> bool
 
-  val inter : t -> t -> (t, e) Either.t
+  val inter : t -> t -> (t, e) result
 
   val values : t -> int list
 end = struct
@@ -158,7 +161,7 @@ end = struct
       in
       Result.get_ok bounds
     in
-    make lo hi |> Result.fold ~ok:Either.left ~error:Either.right
+    make lo hi
 
   let values {lo; hi} = List.init (1 + hi - lo) (fun i -> lo + i)
 end
@@ -186,17 +189,15 @@ end = struct
     let split_by p xx =
       let map_fst f (a, b) = (f a, b) in
       let map_snd f (a, b) = (a, f b) in
-      let f x g =
-        List.cons x |> (if p x then map_fst else map_snd) |> Fun.compose g
-      in
-      List.fold_right f xx Fun.id ([], [])
+      let f x = List.cons x |> if p x then map_fst else map_snd in
+      List.fold_right f xx ([], [])
     in
     let aa, bb = split_by Span.(fun a -> a.lo < x.lo) xx in
     if
       bb
       |> List.exists (fun a ->
              Span.inter a x
-             |> Either.fold ~left:(Fun.const true) ~right:(Fun.const false) )
+             |> Result.fold ~ok:(Fun.const true) ~error:(Fun.const false) )
     then Error Collision
     else List.fold_left List.append [] [aa; [x]; bb] |> Result.ok
 
@@ -209,12 +210,14 @@ end = struct
     List.fold_left f (Ok xx)
 end
 
+type sched = (Name.t * Times.t DayMap.t) IdMap.t
+
 module Schema = struct
   open Sexplib.Std
 
-  type span = int * int [@@deriving sexp]
+  type bounds = int * int [@@deriving sexp]
 
-  type entry = {id: string; name: string; table: span array array}
+  type entry = {id: string; name: string; table: bounds array array}
   [@@deriving sexp]
 
   type t = entry array [@@deriving sexp]
@@ -222,31 +225,28 @@ module Schema = struct
   type e =
     | BadId of Id.e
     | BadName of Name.e
+    | BadDay of Day.e
     | BadTime of Time.e
     | BadSpan of Span.e
     | TimesCollision of Times.e
     | NameCollision of string * string
 
-  let to_courses schema =
+  let to_sched schema =
     let ( let* ) = Result.bind in
     let make_pair {id; name; table} =
       let* id = Id.make id |> Result.map_error (fun e -> BadId e) in
       let* name = Name.make name |> Result.map_error (fun e -> BadName e) in
       let* time_table =
-        let* bounds_matrix =
+        let* span_matrix =
+          let span_of_bounds (lo, hi) =
+            let time t = Time.make t |> Result.map_error (fun e -> BadTime e) in
+            let* lo = time lo in
+            let* hi = time hi in
+            Span.make lo hi |> Result.map_error (fun e -> BadSpan e)
+          in
           Seq.init (Seq.length Day.values) (fun i ->
               try Array.to_seq table.(i) with Invalid_argument _ -> Seq.empty )
-          |> traverse_seq
-               (traverse_seq (fun (lo, hi) ->
-                    let* lo = Time.make lo in
-                    let* hi = Time.make hi in
-                    Ok (lo, hi) ) )
-          |> Result.map_error (fun e -> BadTime e)
-        in
-        let* span_matrix =
-          bounds_matrix
-          |> traverse_seq (traverse_seq (fun (lo, hi) -> Span.make lo hi))
-          |> Result.map_error (fun e -> BadSpan e)
+          |> traverse_seq (traverse_seq span_of_bounds)
         in
         span_matrix |> traverse_seq Times.of_seq |> Result.map Array.of_seq
         |> Result.map_error (fun e -> TimesCollision e)
@@ -271,6 +271,21 @@ module Schema = struct
       | exception Not_found ->
           IdMap.add id desc acc |> Result.ok
     in
-    Array.to_seq schema |> Seq.map make_pair
-    |> Seq.fold_left add_pair (Ok IdMap.empty)
+    let encode_days (id, (name, time_table)) =
+      let convert (i, tt) =
+        Day.(i + to_int min |> make)
+        |> Result.map (fun d -> (d, tt))
+        |> Result.map_error (fun e -> BadDay e)
+      in
+      time_table |> Array.to_seq
+      |> Seq.mapi (fun i tt -> (i, tt))
+      |> traverse_seq convert
+      |> Result.map (fun chart -> (id, (name, chart)))
+    in
+    let* arrays_sched =
+      Array.to_seq schema |> Seq.map make_pair
+      |> Seq.fold_left add_pair (Ok IdMap.empty)
+    in
+    arrays_sched |> IdMap.to_seq |> traverse_seq encode_days
+    |> Result.map IdMap.of_seq
 end
