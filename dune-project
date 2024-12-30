@@ -4,7 +4,12 @@
 
 (generate_opam_files true)
 
+(source
+ (github Ame-no-mihashira/squeeze))
+
 (authors "Ame-no-mihashira <>")
+
+(maintainers "Ame-no-mihashira <>")
 
 (license MIT)
 
