@@ -1,22 +1,28 @@
-let rec foldr_seq f xx b =
-  Seq.uncons xx
-  |> Option.fold ~none:b ~some:(fun (x, xx) -> foldr_seq f xx b |> f x)
+module ExSeq = struct
+  let ( <$> ) = Seq.map
 
-let apply_seq f x = Result.bind f (fun f -> Result.map f x)
+  let ( <*> ) f x = Result.bind f (fun f -> Result.map f x)
 
-let traverse_seq f xx =
-  foldr_seq apply_seq
-    (Seq.map (Fun.compose (Result.map Seq.cons) f) xx)
-    (Ok Seq.empty)
+  let apply = ( <*> )
 
-let sequence_seq xx = traverse_seq Fun.id xx
+  let rec foldr f xx b =
+    Seq.uncons xx
+    |> Option.fold ~none:b ~some:(fun (x, xx) -> foldr f xx b |> f x)
+
+  let traverse f xx =
+    foldr ( <*> )
+      (Seq.map (Fun.compose (Result.map Seq.cons) f) xx)
+      (Ok Seq.empty)
+
+  let sequence xx = traverse Fun.id xx
+end
 
 module Name : sig
   type t
 
   type e = Empty
 
-  val make : string -> (t, e) result
+  val make : string -> (t, e) Result.t
 
   val equal : t -> t -> bool
 
@@ -38,7 +44,7 @@ module Id : sig
 
   type e = Empty | Spaced
 
-  val make : string -> (t, e) result
+  val make : string -> (t, e) Result.t
 
   val compare : t -> t -> int
 end = struct
@@ -70,7 +76,7 @@ module Day : sig
 
   val max : t
 
-  val make : int -> (t, e) result
+  val make : int -> (t, e) Result.t
 
   val compare : t -> t -> int
 
@@ -110,7 +116,7 @@ module Time : sig
 
   val max : t
 
-  val make : int -> (t, e) result
+  val make : int -> (t, e) Result.t
 
   val to_int : t -> int
 end = struct
@@ -132,13 +138,13 @@ module Span : sig
 
   type e = Empty
 
-  val make : Time.t -> Time.t -> (t, e) result
+  val make : Time.t -> Time.t -> (t, e) Result.t
 
   val disjoint : t -> t -> bool
 
-  val inter : t -> t -> (t, e) result
+  val inter : t -> t -> (t, e) Result.t
 
-  val values : t -> int list
+  val values : t -> int List.t
 end = struct
   type t = {lo: int; hi: int}
 
@@ -173,13 +179,13 @@ module Times : sig
 
   val empty : t
 
-  val of_seq : Span.t Seq.t -> (t, e) result
+  val of_seq : Span.t Seq.t -> (t, e) Result.t
 
-  val add : Span.t -> t -> (t, e) result
+  val add : Span.t -> t -> (t, e) Result.t
 
-  val fuse : t -> t -> (t, e) result
+  val fuse : t -> t -> (t, e) Result.t
 end = struct
-  type t = Span.t list
+  type t = Span.t List.t
 
   type e = Collision
 
@@ -201,9 +207,7 @@ end = struct
     then Error Collision
     else List.fold_left List.append [] [aa; [x]; bb] |> Result.ok
 
-  let of_seq =
-    let f acc x = Result.bind acc (add x) in
-    Seq.fold_left f (Ok empty)
+  let of_seq xx = Seq.fold_left Result.bind (Ok empty) (Seq.map add xx)
 
   let fuse xx =
     let f acc x = Result.bind acc (add x) in
@@ -212,7 +216,24 @@ end
 
 type sched = (Name.t * Times.t DayMap.t) IdMap.t
 
-module Schema = struct
+module Schema : sig
+  type t
+
+  type e =
+    | BadId of Id.e
+    | BadName of Name.e
+    | BadDay of Day.e
+    | BadTime of Time.e
+    | BadSpan of Span.e
+    | TimesCollision of Times.e
+    | NameCollision of string * string
+
+  val to_sched : t -> (sched, e) Result.t
+
+  val t_of_sexp : Sexplib0.Sexp.t -> t
+
+  val sexp_of_t : t -> Sexplib0.Sexp.t
+end = struct
   open Sexplib.Std
 
   type bounds = int * int [@@deriving sexp]
@@ -236,7 +257,7 @@ module Schema = struct
     let make_pair {id; name; table} =
       let* id = Id.make id |> Result.map_error (fun e -> BadId e) in
       let* name = Name.make name |> Result.map_error (fun e -> BadName e) in
-      let* time_table =
+      let* times =
         let* span_matrix =
           let span_of_bounds (lo, hi) =
             let time t = Time.make t |> Result.map_error (fun e -> BadTime e) in
@@ -246,46 +267,47 @@ module Schema = struct
           in
           Seq.init (Seq.length Day.values) (fun i ->
               try Array.to_seq table.(i) with Invalid_argument _ -> Seq.empty )
-          |> traverse_seq (traverse_seq span_of_bounds)
+          |> ExSeq.traverse (ExSeq.traverse span_of_bounds)
         in
-        span_matrix |> traverse_seq Times.of_seq |> Result.map Array.of_seq
+        span_matrix
+        |> ExSeq.traverse Times.of_seq
         |> Result.map_error (fun e -> TimesCollision e)
       in
-      Ok (id, (name, time_table))
+      let* table =
+        let* dtts =
+          times
+          |> Seq.mapi (fun i tt ->
+                 let* d = Day.(i + to_int min |> make) in
+                 Ok (d, tt) )
+          |> ExSeq.sequence
+          |> Result.map_error (fun e -> BadDay e)
+        in
+        Seq.fold_left Result.bind (Ok DayMap.empty)
+          (Seq.map (fun (d, tt) acc -> DayMap.add d tt acc |> Result.ok) dtts)
+      in
+      Ok (id, (name, table))
     in
-    let add_pair acc x =
-      let* acc = acc in
-      let* id, ((name, time_table) as desc) = x in
-      match IdMap.find id acc with
-      | o_name, o_time_table ->
-          if Name.equal o_name name then
-            let* tss =
-              Array.map2 Times.fuse time_table o_time_table
-              |> Array.to_seq |> sequence_seq |> Result.map Array.of_seq
-              |> Result.map_error (fun e -> TimesCollision e)
-            in
-            IdMap.add id (name, tss) acc |> Result.ok
-          else
+    let add_pair (id, (name, table)) acc =
+      match IdMap.find_opt id acc with
+      | None ->
+          IdMap.add id (name, table) acc |> Result.ok
+      | Some (o_name, o_table) ->
+          if not (Name.equal o_name name) then
             NameCollision (Name.to_string o_name, Name.to_string name)
             |> Result.error
-      | exception Not_found ->
-          IdMap.add id desc acc |> Result.ok
+          else
+            let f d o_tt table =
+              let* table = table in
+              let tt = DayMap.find d table in
+              Times.fuse tt o_tt
+              |> Result.map (fun tt ->
+                     DayMap.update d (Fun.const (Some tt)) table )
+            in
+            DayMap.fold f o_table (Ok table)
+            |> Result.map (fun table ->
+                   IdMap.update id (Some (name, table) |> Fun.const) acc )
+            |> Result.map_error (fun e -> TimesCollision e)
     in
-    let encode_days (id, (name, time_table)) =
-      let convert (i, tt) =
-        Day.(i + to_int min |> make)
-        |> Result.map (fun d -> (d, tt))
-        |> Result.map_error (fun e -> BadDay e)
-      in
-      time_table |> Array.to_seq
-      |> Seq.mapi (fun i tt -> (i, tt))
-      |> traverse_seq convert
-      |> Result.map (fun chart -> (id, (name, chart)))
-    in
-    let* arrays_sched =
-      Array.to_seq schema |> Seq.map make_pair
-      |> Seq.fold_left add_pair (Ok IdMap.empty)
-    in
-    arrays_sched |> IdMap.to_seq |> traverse_seq encode_days
-    |> Result.map IdMap.of_seq
+    let* pairs = Array.to_seq schema |> ExSeq.traverse make_pair in
+    pairs |> Seq.map add_pair |> Seq.fold_left Result.bind (Ok IdMap.empty)
 end
